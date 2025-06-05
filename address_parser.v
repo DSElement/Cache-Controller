@@ -1,4 +1,4 @@
-module address_decoder (
+module address_parser (
     input  [31:0] addr,
     output [20:0] tag,
     output [6:0]  index,
