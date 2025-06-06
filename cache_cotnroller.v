@@ -4,7 +4,6 @@ module cache_controller (
     input wire clk,
     input wire rst_n,
 
-    // CPU interface
     input wire cpu_req_enable,
     input wire cpu_req_rw,              // 0 = read, 1 = write
     input wire [31:0] cpu_req_addr,
@@ -12,39 +11,28 @@ module cache_controller (
     output reg [31:0] cpu_res_dataout,
     output reg cpu_res_ready,
 
-    // Main memory interface
     output reg mem_req_enable,
-    output reg mem_req_rw,              // 0 = read, 1 = write
+    output reg mem_req_rw,              
     output reg [31:0] mem_req_addr,
     output reg [511:0] mem_req_dataout,
     input wire [511:0] mem_req_datain,
     input wire mem_req_ready
 );
 
-// =============== Internal Constants ===============
 localparam IDLE          = 3'b000;
 localparam CHECK_HIT     = 3'b001;
 localparam EVICT         = 3'b010;
 localparam ALLOCATE      = 3'b011;
 localparam SEND_TO_CPU   = 3'b100;
 
-// =============== Address Fields ===============
-wire [20:0] addr_tag      = cpu_req_addr[31:11];  // 21 bits
-wire [6:0]  addr_index    = cpu_req_addr[10:4];   // 128 sets (7 bits)
-wire [3:0]  addr_offset   = cpu_req_addr[3:0];    // 16 words per block (4 bits)
+wire [20:0] addr_tag      = cpu_req_addr[31:11];  
+wire [6:0]  addr_index    = cpu_req_addr[10:4];   
+wire [3:0]  addr_offset   = cpu_req_addr[3:0];    
 
-// =============== FSM State ===============
 reg [2:0] state, next_state;
 
-// =============== Cache Line Definition ===============
-// [536]    valid
-// [535]    dirty
-// [534:533] age
-// [532:512] tag
-// [511:0]   data block (16 words)
-reg [536:0] cache[0:127][0:3]; // 128 sets × 4 ways
+reg [536:0] cache[0:127][0:3]; 
 
-// =============== Internal Variables ===============
 integer i;
 reg [1:0] hit_way;
 reg hit;
@@ -53,38 +41,40 @@ reg [1:0] lru_way;
 reg [511:0] block_buffer;
 reg [31:0] data_word;
 
-//insantiere replacer
 wire [511:0] replaced_block;
 reg replacer_enable;
 
-replacer word_replacer (
-    .data_in(cache[addr_index][hit_way][511:0]),
-    .word_offset(addr_offset),
-    .data_write(cpu_req_datain),
-    .enable(replacer_enable),
-    .data_out(replaced_block)
-);
-
-//register declarations
 reg latched_rw;
 reg [3:0] latched_offset;
 reg [31:0] latched_data;
 reg [20:0] latched_tag;
 
 
+replacer word_replacer (
+    .data_in(latched_rw ? mem_req_datain : cache[addr_index][hit_way][511:0]),
+    .word_offset(addr_offset),
+    .data_write(cpu_req_datain),
+    .enable(replacer_enable),
+    .data_out(replaced_block)
+);
 
-// =============== FSM ===============
+
+
+integer s,w;
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-        state <= IDLE;
+    for (s = 0; s < 128; s = s + 1) begin
+            for (w = 0; w < 4; w = w + 1) begin
+                cache[s][w] <= 537'd0; 
+            end
+        end
+	state <= IDLE;
     end else begin
         state <= next_state;
     end
 end
 
 always @(*) begin
-    // default transitions
-    //next_state = state;
     cpu_res_ready = 0;
     mem_req_enable = 0;
 
@@ -100,10 +90,14 @@ always @(*) begin
         end
 
         CHECK_HIT: begin
+	    hit = 0;
+	    evict_needed = 0;
+	    replacer_enable = 0;
+
             hit = 0;
             hit_way = 2'b00;
 
-            // Search all 4 ways for a hit
+           
             for (i = 0; i < 4; i = i + 1) begin
                 if (cache[addr_index][i][536] == 1'b1 &&  // valid
                     cache[addr_index][i][532:512] == addr_tag) begin
@@ -115,18 +109,15 @@ always @(*) begin
             if (hit) begin
 
 		if (latched_rw == 1'b0) begin
-                    // READ hit: extract word
                     next_state = SEND_TO_CPU;
                     end else begin
-                    // WRITE hit: use replacer
+		    
                     replacer_enable = 1;
-                    #1; // allow one delta cycle (for simulation)
                     cache[addr_index][hit_way][511:0] = replaced_block;
-                    cache[addr_index][hit_way][535] = 1'b1; // set dirty bit
+                    cache[addr_index][hit_way][535] = 1'b1; 
                     next_state = IDLE;
                 end
 
-                // Extract word from hit block
                 block_buffer = cache[addr_index][hit_way][511:0];
                 case (addr_offset)
                     4'd0:  data_word = block_buffer[ 31:  0];
@@ -148,31 +139,26 @@ always @(*) begin
                     default: data_word = 32'd0;
                 endcase
 
-                // LRU update logic on hit
                 for (i = 0; i < 4; i = i + 1) begin
                     if (i != hit_way && cache[addr_index][i][536] == 1'b1) begin
-                        // If age is less than hit way’s original age, increment
                         if (cache[addr_index][i][534:533] < cache[addr_index][hit_way][534:533]) begin
                             cache[addr_index][i][534:533] = cache[addr_index][i][534:533] + 1;
                         end
                     end
                 end
-                // Reset age of the accessed way to 0
                 cache[addr_index][hit_way][534:533] = 2'b00;
 
             end else begin
-                // Find invalid way first
                 evict_needed = 1;
                 lru_way = 2'b00;
 
                 for (i = 0; i < 4; i = i + 1) begin
-                    if (cache[addr_index][i][536] == 0) begin // valid == 0
+                    if (cache[addr_index][i][536] == 0) begin 
                         lru_way = i[1:0];
                         evict_needed = 0;
                     end
                 end
 
-                // If all valid, find LRU (age == 3)
                 if (evict_needed) begin
                     for (i = 0; i < 4; i = i + 1) begin
                         if (cache[addr_index][i][534:533] == 2'b11) begin
@@ -182,14 +168,12 @@ always @(*) begin
                 end
 
                 if (evict_needed && cache[addr_index][lru_way][535] == 1'b1) begin
-                    // Dirty → Evict before allocate
                     mem_req_enable = 1;
                     mem_req_rw = 1;
                     mem_req_addr = {cache[addr_index][lru_way][532:512], addr_index, 4'b0000};
                     mem_req_dataout = cache[addr_index][lru_way][511:0];
                     next_state = EVICT;
                 end else begin
-                    // Clean or invalid → go to allocation
                     mem_req_enable = 1;
                     mem_req_rw = 0;
                     mem_req_addr = {addr_tag, addr_index, 4'b0000};
@@ -202,7 +186,6 @@ always @(*) begin
 
         EVICT: begin
             if (mem_req_ready) begin
-                // After write-back, request memory read
                 mem_req_enable = 1;
                 mem_req_rw = 0;
                 mem_req_addr = {addr_tag, addr_index, 4'b0000};
@@ -212,36 +195,28 @@ always @(*) begin
 
         ALLOCATE: begin
             if (mem_req_ready) begin
-                // Step 1: Get the fetched block
                 block_buffer = mem_req_datain;
 
-                // Step 2: Overwrite if it's a write miss
                 if (latched_rw == 1'b1) begin
-                    // write hit simulation: modify block with replacer
                     replacer_enable = 1;
-                    #1; // allow delta cycle (simulation-safe)
                     cache[addr_index][lru_way][511:0] = replaced_block;
-                    cache[addr_index][lru_way][535] = 1'b1;  // dirty
                 end else begin
                     cache[addr_index][lru_way][511:0] = block_buffer;
-                    cache[addr_index][lru_way][535] = 1'b0;  // clean (read miss)
+                    cache[addr_index][lru_way][535] = 1'b0;  
                 end
 
-                // Step 3: Tag, valid, age
-                cache[addr_index][lru_way][536] = 1'b1;       // valid
-                cache[addr_index][lru_way][534:533] = 2'b00;  // youngest
+                cache[addr_index][lru_way][536] = 1'b1;       
+                cache[addr_index][lru_way][534:533] = 2'b00;  
                 cache[addr_index][lru_way][532:512] = addr_tag;
 
-                // Step 4: Age update for other ways
+                
                 for (i = 0; i < 4; i = i + 1) begin
                     if (i != lru_way && cache[addr_index][i][536] == 1'b1) begin
                         cache[addr_index][i][534:533] = cache[addr_index][i][534:533] + 1;
                     end
                 end
 
-                // Step 5: Post-allocate action
                 if (cpu_req_rw == 1'b0) begin
-                    // If read miss, return fetched word to CPU
                     case (addr_offset)
                         4'd0:  data_word = block_buffer[ 31:  0];
                         4'd1:  data_word = block_buffer[ 63: 32];
@@ -263,7 +238,6 @@ always @(*) begin
                     endcase
                     next_state = SEND_TO_CPU;
                 end else begin
-                    // If write miss: write was completed, just return
                     next_state = IDLE;
                 end
             end
@@ -280,15 +254,6 @@ always @(*) begin
 
     endcase
 end
-
-// =============== TODO (Next Steps) ===============
-// 1. Implement hit detection logic
-// 2. Implement LRU update logic
-// 3. Implement eviction and write-back path
-// 4. Implement block allocation path
-// 5. Read/write CPU word in 512-bit block
-// 6. Integrate with replacer.v for write operations
-
 endmodule
 
 
@@ -311,7 +276,6 @@ module cache_controller_tb;
     reg [511:0] mem_req_datain;
     reg mem_req_ready;
 
-    // Instantiate DUT
     cache_controller dut (
         .clk(clk),
         .rst_n(rst_n),
@@ -329,10 +293,8 @@ module cache_controller_tb;
         .mem_req_ready(mem_req_ready)
     );
 
-    // Clock generation
     always #5 clk = ~clk;
 
-    // Initialize
     task reset();
     begin
         clk = 0; rst_n = 0;
@@ -344,7 +306,6 @@ module cache_controller_tb;
     end
     endtask
 
-    // Send CPU read
     task cpu_read(input [31:0] addr);
     begin
         @(negedge clk);
@@ -356,7 +317,6 @@ module cache_controller_tb;
     end
     endtask
 
-    // Send CPU write
     task cpu_write(input [31:0] addr, input [31:0] data);
     begin
         @(negedge clk);
@@ -369,7 +329,6 @@ module cache_controller_tb;
     end
     endtask
 
-    // Provide memory response
     task memory_respond(input [511:0] data);
     begin
         @(posedge clk);
@@ -383,38 +342,65 @@ module cache_controller_tb;
     initial begin
         reset();
 
-        // Test 1: Read miss (block load)
         $display("Test 1: Read miss → memory load");
-        cpu_read(32'h0000_0010); // index = 0, offset = 4
+        cpu_read(32'h0000_0010); 
         #50;
         memory_respond(512'hBADBADBADBADBADBADBADBADBADBADBADBADBADBADBADBADBADBADBADBADBADB);
         wait (cpu_res_ready);
         $display("Read data: %h", cpu_res_dataout);
 
-        // Test 2: Read hit
         $display("Test 2: Read hit → should reuse block");
         cpu_read(32'h0000_0010);
         wait (cpu_res_ready);
         $display("Read data: %h", cpu_res_dataout);
 
-        // Test 3: Write hit
         $display("Test 3: Write hit");
         cpu_write(32'h0000_0010, 32'hDEADBEEF);
         #50;
 
-        // Test 4: Read after write (verify write took effect)
         $display("Test 4: Read after write (verify DEADBEEF)");
         cpu_read(32'h0000_0010);
         wait (cpu_res_ready);
         $display("Read data: %h", cpu_res_dataout);
 
-        // Test 5: Write miss (different index, should load block then write)
         $display("Test 5: Write miss to new index");
         cpu_write(32'h0000_1004, 32'hCAFEBABE);
         #50;
         memory_respond(512'hFEEDFACEFEEDFACEFEEDFACEFEEDFACEFEEDFACEFEEDFACEFEEDFACEFEEDFACE);
 
-        // Optional: More tests for eviction when all ways are full and dirty
+        $display("Test 6: Fill all 4 ways (index=0, 4 different tags)");
+        cpu_read(32'h0000_0010); 
+        #50; memory_respond(512'hA0);
+        cpu_read(32'h1000_0010); 
+        #50; memory_respond(512'hA1);
+        cpu_read(32'h2000_0010); 
+        #50; memory_respond(512'hA2);
+        cpu_read(32'h3000_0010); 
+        #50; memory_respond(512'hA3);
+
+        $display("Test 7: Read miss causes eviction (tag 4, index=0)");
+        cpu_read(32'h4000_0010); 
+        #50; memory_respond(512'hA4);
+        wait (cpu_res_ready);
+        $display("Read data after eviction: %h", cpu_res_dataout);
+
+        $display("Test 8: Make all 4 current blocks dirty (tags 1-4)");
+        cpu_write(32'h1000_0010, 32'h11111111); 
+        #10;
+        cpu_write(32'h2000_0010, 32'h22222222); 
+        #10;
+        cpu_write(32'h3000_0010, 32'h33333333); 
+        #10;
+        cpu_write(32'h4000_0010, 32'h44444444); 
+        #10;
+
+        $display("Test 9: Write miss with dirty eviction (tag 5 evicts tag 1)");
+        cpu_write(32'h5000_0010, 32'h55555555); 
+        #50;
+        memory_respond(512'hA5); 
+
+        $display("Eviction test completed.");
+
 
         $display("Testbench completed.");
         #100 $finish;
